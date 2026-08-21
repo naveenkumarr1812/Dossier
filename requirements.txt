@@ -1,0 +1,8 @@
+streamlit>=1.36
+pandas
+openpyxl
+pypdfium2
+pillow
+fuzzywuzzy
+python-Levenshtein
+groq
