@@ -36,7 +36,7 @@ try:
 except ImportError:
     pdfium = None
 
-from groq import Groq
+from groq import Groq, RateLimitError
 
 
 # ============================================================================
@@ -54,7 +54,7 @@ DOC_ICONS = {
 # retired June 2026) — if extraction starts failing silently, check
 # console.groq.com/docs/models for the current vision-capable model name
 # and update this constant.
-APP_BUILD = "2026-08-21-v4"  # bump this yourself if you want a quick sanity check that
+APP_BUILD = "2026-08-21-v5"  # bump this yourself if you want a quick sanity check that
                               # the running server picked up your latest file changes
 GROQ_VISION_MODEL = "qwen/qwen3.6-27b"
 NAME_MATCH_THRESHOLD = 80
@@ -327,11 +327,48 @@ def get_session_workspace() -> Path:
     return ws
 
 
-def get_groq_client():
-    api_key = st.session_state.get("groq_api_key", "")
-    if not api_key:
-        return None
-    return Groq(api_key=api_key)
+def parse_api_keys(raw_keys: str) -> list[str]:
+    """Parse comma/newline-separated API keys, preserving order and removing duplicates."""
+    keys = []
+    for key in re.split(r"[,;\r\n]+", raw_keys or ""):
+        key = key.strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+class GroqClientPool:
+    """Use the active key until it is rate-limited, then fail over to the next one."""
+
+    def __init__(self, api_keys: list[str], client_factory=Groq):
+        if not api_keys:
+            raise ValueError("At least one Groq API key is required")
+        self.clients = [client_factory(api_key=key) for key in api_keys]
+        self.active_index = 0
+        self.failover_count = 0
+
+    @property
+    def active_key_number(self) -> int:
+        return self.active_index + 1
+
+    def create_chat_completion(self, **kwargs):
+        for offset in range(len(self.clients)):
+            index = (self.active_index + offset) % len(self.clients)
+            try:
+                response = self.clients[index].chat.completions.create(**kwargs)
+            except RateLimitError:
+                self.failover_count += 1
+                continue
+            self.active_index = index
+            return response
+        raise RuntimeError(
+            f"All {len(self.clients)} Groq API keys have reached their rate or quota limit."
+        )
+
+
+def get_groq_client_pool() -> GroqClientPool | None:
+    api_keys = parse_api_keys(st.session_state.get("groq_api_keys_input", ""))
+    return GroqClientPool(api_keys) if api_keys else None
 
 
 def file_to_image_path(filepath: str):
@@ -402,7 +439,7 @@ def extract_json_block(raw: str) -> dict:
     return json.loads(match.group(0))
 
 
-def extract_info_with_vision(client, filepath: str, filename: str) -> dict:
+def extract_info_with_vision(client_pool, filepath: str, filename: str) -> dict:
     image_path, err = file_to_image_path(filepath)
     if not image_path:
         return {"employee_name": None, "document_type": "Unknown", "id_number": None, "_error": err}
@@ -410,7 +447,7 @@ def extract_info_with_vision(client, filepath: str, filename: str) -> dict:
     raw = None
     try:
         data_url = image_to_data_url(image_path)
-        response = client.chat.completions.create(
+        response = client_pool.create_chat_completion(
             model=GROQ_VISION_MODEL,
             messages=[{
                 "role": "user",
@@ -507,23 +544,31 @@ def render_step1():
                 key="step1_uploader",
             )
         with col2:
-            st.session_state.groq_api_key = st.text_input(
-                "Groq API key", type="password",
-                value=st.session_state.get("groq_api_key", os.environ.get("GROQ_API_KEY", "")),
-                help="From console.groq.com/keys",
+            default_keys = (
+                st.session_state.get("groq_api_key", "")
+                or os.environ.get("GROQ_API_KEYS", "")
+                or os.environ.get("GROQ_API_KEY", "")
             )
+            st.session_state.setdefault("groq_api_keys_input", default_keys)
+            st.text_input(
+                "Groq API keys", type="password", key="groq_api_keys_input",
+                help="Paste one or more keys separated by commas. If one reaches its limit, the next key takes over.",
+            )
+            api_keys = parse_api_keys(st.session_state.get("groq_api_keys_input", ""))
+            if api_keys:
+                st.caption(f"{len(api_keys)} API key(s) configured")
             threshold = st.slider("Name match strictness", 60, 95, NAME_MATCH_THRESHOLD, 5,
                                    help="Higher = stricter matching when grouping name variants across documents")
         st.markdown('</div>', unsafe_allow_html=True)
 
     if uploaded_files:
         st.caption(f"{len(uploaded_files)} file(s) ready.")
-        run = st.button("▸ Run extraction", disabled=not st.session_state.get("groq_api_key"))
-        if not st.session_state.get("groq_api_key"):
-            st.info("Enter your Groq API key to run extraction.")
+        run = st.button("▸ Run extraction", disabled=not api_keys)
+        if not api_keys:
+            st.info("Enter at least one Groq API key to run extraction.")
 
         if run:
-            client = get_groq_client()
+            client_pool = get_groq_client_pool()
             ws = get_session_workspace()
             records = []
 
@@ -536,7 +581,7 @@ def render_step1():
                 with open(dest, "wb") as f:
                     f.write(uf.getbuffer())
 
-                info = extract_info_with_vision(client, str(dest), uf.name)
+                info = extract_info_with_vision(client_pool, str(dest), uf.name)
 
                 records.append({
                     "employee_name": info.get("employee_name"),
@@ -565,6 +610,12 @@ def render_step1():
             with log_box:
                 st.markdown("".join(log_lines), unsafe_allow_html=True)
 
+            if client_pool.failover_count:
+                st.warning(
+                    f"API key failover was used {client_pool.failover_count} time(s). "
+                    f"Finished with key {client_pool.active_key_number} of {len(api_keys)}."
+                )
+
             records = cluster_employee_names(records, threshold)
             pivot = build_pivot(records)
             st.session_state.pivot_df = pivot
@@ -580,7 +631,7 @@ def render_step1():
         m3.metric("Total documents", len(st.session_state.raw_records))
 
         st.markdown("**Review before download** — file names only need to stay exact in cells you don't touch; you can fix names, move a doc to the right column, or leave a cell blank.")
-        edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, key="editor1")
+        edited = st.data_editor(df, num_rows="dynamic", width="stretch", key="editor1")
 
         excel_bytes = df_to_excel_bytes(edited)
         st.download_button(
